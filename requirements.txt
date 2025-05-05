@@ -1,0 +1,9 @@
+tensorflow
+numpy
+opencv-python
+gradio
+matplotlib
+geopy
+pillow
+sentinelhub==3.9.0
+python-dotenv
