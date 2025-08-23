@@ -1,0 +1,11 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+pydantic==2.9.0
+python-dotenv==1.0.1
+geopy==2.4.1
+Pillow>=10.4.0
+numpy>=1.26.0
+opencv-python>=4.10.0
+tensorflow>=2.17.0
+sentinelhub>=3.11.0
+requests>=2.32.0

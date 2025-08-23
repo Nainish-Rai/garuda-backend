@@ -1,0 +1,16 @@
+version: "3.8"
+
+services:
+  geospatial-agent:
+    build:
+      context: ./geospatial-agent
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      - CLIENT_ID=${CLIENT_ID}
+      - CLIENT_SECRET=${CLIENT_SECRET}
+    volumes:
+      - ./unet_model.h5:/app/unet_model.h5
+      - ./.env:/app/.env
+    restart: unless-stopped
