@@ -1,5 +1,5 @@
 import asyncio
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, List
 import base64
 from io import BytesIO
 from geopy.geocoders import Nominatim
@@ -250,3 +250,94 @@ class GeospatialService:
 
         except Exception as e:
             raise Exception(f"Urban change analysis failed: {str(e)}")
+
+    async def search_locations(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Search for locations and return detailed information."""
+        try:
+            # Use geocoder to search for multiple results
+            locations = []
+            geocode_results = self.geolocator.geocode(query, exactly_one=False, limit=limit)
+
+            if geocode_results:
+                for result in geocode_results[:limit]:
+                    location_info = {
+                        "name": result.address,
+                        "display_name": result.address,
+                        "coordinates": {
+                            "lat": result.latitude,
+                            "lon": result.longitude
+                        },
+                        "bbox": result.raw.get("boundingbox", None) if hasattr(result, 'raw') else None,
+                        "place_type": result.raw.get("type", "unknown") if hasattr(result, 'raw') else "unknown",
+                        "country": result.raw.get("display_name", "").split(", ")[-1] if hasattr(result, 'raw') else "unknown"
+                    }
+                    locations.append(location_info)
+
+            return locations
+        except Exception as e:
+            print(f"Location search error: {e}")
+            return []
+
+    def get_available_dates(self, lat: float, lon: float, buffer: float = 0.025) -> List[str]:
+        """Get available satellite imagery dates for a location."""
+        try:
+            config = SHConfig()
+            config.sh_client_id = self.client_id
+            config.sh_client_secret = self.client_secret
+
+            bbox = BBox([lon - buffer, lat - buffer, lon + buffer, lat + buffer], crs=CRS.WGS84)
+            catalog = SentinelHubCatalog(config=config)
+
+            start_date = datetime(2017, 3, 28)
+            end_date = datetime.now()
+
+            search_iterator = catalog.search(
+                DataCollection.SENTINEL2_L2A,
+                bbox=bbox,
+                time=(start_date, end_date),
+                filter={
+                    "op": "<=",
+                    "args": [
+                        {"property": "eo:cloud_cover"},
+                        20.0  # Allow up to 20% cloud cover for date listing
+                    ]
+                },
+                filter_lang="cql2-json",
+                fields={
+                    "include": ["id", "properties.datetime", "properties.eo:cloud_cover"],
+                    "exclude": []
+                }
+            )
+
+            results = list(search_iterator)
+            dates = [r["properties"]["datetime"][:10] for r in results]
+            return sorted(list(set(dates)))  # Remove duplicates and sort
+        except Exception as e:
+            print(f"Error getting available dates: {e}")
+            return []
+
+    def get_location_info(self, lat: float, lon: float) -> Dict[str, Any]:
+        """Get detailed information about a location."""
+        try:
+            # Reverse geocode to get location details
+            location = self.geolocator.reverse((lat, lon), exactly_one=True)
+
+            if location:
+                return {
+                    "address": location.address,
+                    "coordinates": {"lat": lat, "lon": lon},
+                    "raw_data": location.raw if hasattr(location, 'raw') else {}
+                }
+            else:
+                return {
+                    "address": f"Location at {lat:.4f}, {lon:.4f}",
+                    "coordinates": {"lat": lat, "lon": lon},
+                    "raw_data": {}
+                }
+        except Exception as e:
+            print(f"Reverse geocoding error: {e}")
+            return {
+                "address": f"Location at {lat:.4f}, {lon:.4f}",
+                "coordinates": {"lat": lat, "lon": lon},
+                "raw_data": {}
+            }

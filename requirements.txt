@@ -7,3 +7,5 @@ geopy
 pillow
 sentinelhub==3.9.0
 python-dotenv
+fastapi
+uvicorn[standard]
