@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 import uvicorn
 import io
@@ -13,6 +13,10 @@ import cv2
 import uuid
 import os
 import sys
+import asyncio
+import hashlib
+from pathlib import Path
+import json
 
 # Import the functions from your existing app.py
 from geopy.geocoders import Nominatim
@@ -112,6 +116,32 @@ class LocationSearchResponse(BaseModel):
 class AnalysisHistoryResponse(BaseModel):
     status: str
     analyses: List[Dict[str, Any]]
+
+# NDVI Analysis Models
+class NDVIAnalysisRequest(BaseModel):
+    location: str = Field(..., min_length=1, max_length=200)
+    timeline_start: Optional[str] = None
+    timeline_end: Optional[str] = None
+    zoom_level: str = Field(default="City-Wide (0.025°)")
+    resolution: str = Field(default="Standard (5m)")
+    want_recommendations: Optional[bool] = False
+    want_visualizations: Optional[bool] = True
+    analysis_focus: str = Field(default="vegetation", description="Focus area: vegetation, urban, water, or general")
+
+class NDVIAnalysisResponse(BaseModel):
+    success: bool
+    location: str
+    coordinates: Dict[str, float]
+    timeline_start: str
+    timeline_end: str
+    chosen_dates: List[Dict[str, str]]
+    available_dates_count: int
+    timestamp: str
+    ndvi_analysis: Dict[str, Any]
+    change_analysis: Dict[str, Any]
+    recommendations: List[str] = []
+    visualizations: Dict[str, str] = {}
+    socioeconomic_correlation: Optional[Dict[str, Any]] = None
 
 # ===== UTILITY FUNCTIONS =====
 
@@ -333,6 +363,352 @@ def search_locations(query: str, limit: int = 10) -> List[Dict[str, Any]]:
         print(f"Location search error: {e}")
         return []
 
+# NDVI Analysis Utility Functions
+CACHE_DIR = Path("sentinel_cache")
+CACHE_DIR.mkdir(exist_ok=True)
+
+# Thresholds for change detection
+DNDVI_T = 0.07
+DNDBI_T = 0.07
+DNDWI_T = 0.07
+VALID_MIN = 0.01
+
+def _sentinel_cache_key(lat: float, lon: float, date: str, buf: float, res: float) -> Path:
+    h = hashlib.sha256(f"{lat:.6f},{lon:.6f},{date},{buf},{res}".encode()).hexdigest()
+    return CACHE_DIR / f"{h}.npz"
+
+def _normalize_for_ndvi(img: np.ndarray) -> np.ndarray:
+    p2, p98 = np.percentile(img, (2, 98))
+    return np.clip((img - p2) / (p98 - p2 + 1e-9), 0, 1)
+
+def find_smart_dates(lat: float, lon: float, buf: float,
+                     t0: Optional[str], t1: Optional[str]) -> tuple[str, str, List[Dict[str, str]]]:
+    """Find optimal dates for NDVI analysis with low cloud cover and good temporal separation"""
+    config = SHConfig()
+    config.sh_client_id = CLIENT_ID
+    config.sh_client_secret = CLIENT_SECRET
+
+    cat = SentinelHubCatalog(config=config)
+    bbox = BBox([lon - buf, lat - buf, lon + buf, lat + buf], crs=CRS.WGS84)
+    time_from = datetime.strptime(t0, "%Y-%m-%d") if t0 else datetime(2018, 1, 1)
+    time_to = datetime.strptime(t1, "%Y-%m-%d") if t1 else datetime.now()
+
+    results = cat.search(
+        DataCollection.SENTINEL2_L2A,
+        bbox=bbox,
+        time=(time_from, time_to),
+        fields={"include": ["properties.datetime", "properties.eo:cloud_cover"], "exclude": []},
+    )
+
+    # Collect dates with cloud cover
+    rows = []
+    for r in results:
+        dt = r["properties"]["datetime"][:10]
+        cc = r["properties"].get("eo:cloud_cover")
+        try:
+            cc_val = float(cc) if cc is not None else 100.0
+        except Exception:
+            cc_val = 100.0
+        rows.append((dt, cc_val))
+
+    if not rows:
+        return None, None, []
+
+    # Group by unique date, keep min cloud cover per date
+    by_date: Dict[str, float] = {}
+    for dt, cc in rows:
+        if (dt not in by_date) or (cc < by_date[dt]):
+            by_date[dt] = cc
+
+    # Sort by date and create list with cloud cover
+    sorted_dates = sorted(by_date.items(), key=lambda x: x[0])
+    all_dates = [{"date": d, "cloud": f"{c:.1f}"} for d, c in sorted_dates]
+
+    # Split into quartiles, pick least-cloudy in first and last quartiles
+    n = len(sorted_dates)
+    q = max(1, n // 4)
+    first_q = sorted_dates[:q] if n >= 4 else sorted_dates[: max(1, n // 2)]
+    last_q = sorted_dates[-q:] if n >= 4 else sorted_dates[-max(1, n // 2):]
+
+    before = min(first_q, key=lambda x: x[1])  # (date, cloud)
+    after = min(last_q, key=lambda x: x[1])
+
+    return before[0], after[0], all_dates
+
+async def fetch_ndvi_image(lat: float, lon: float, date: str, buf: float, res_m: float) -> Optional[dict]:
+    """Fetch satellite image with bands needed for NDVI analysis"""
+    cache_path = _sentinel_cache_key(lat, lon, date, buf, res_m)
+    if cache_path.exists():
+        try:
+            with np.load(cache_path, allow_pickle=True) as npz:
+                raw = npz["raw"]
+                rgb = Image.fromarray(npz["rgb"])
+            return {"raw": raw, "rgb": rgb}
+        except Exception as e:
+            print(f"Cache load failed for {date}: {e}")
+            try:
+                cache_path.unlink()
+            except Exception:
+                pass
+
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, _blocking_fetch_ndvi, lat, lon, date, buf, res_m)
+    if result:
+        try:
+            np.savez_compressed(cache_path, raw=result["raw"], rgb=np.array(result["rgb"]))
+        except Exception as e:
+            print(f"Cache save failed for {date}: {e}")
+    return result
+
+def _blocking_fetch_ndvi(lat: float, lon: float, date: str, buf: float, res_m: float) -> Optional[dict]:
+    """Fetch satellite data with bands for NDVI calculation"""
+    config = SHConfig()
+    config.sh_client_id = CLIENT_ID
+    config.sh_client_secret = CLIENT_SECRET
+
+    bbox = BBox([lon - buf, lat - buf, lon + buf, lat + buf], crs=CRS.WGS84)
+    dims = bbox_to_dimensions(bbox, resolution=res_m)
+    dims = (max(128, min(dims[0], 2048)), max(128, min(dims[1], 2048)))
+
+    evalscript = """
+    //VERSION=3
+    function setup() {
+      return {
+        input: [{ bands: ["B02","B03","B04","B08","B11"], units: "DN" }],
+        output: { bands: 5, sampleType: "FLOAT32" }
+      };
+    }
+    function evaluatePixel(s) {
+      return [s.B02/10000, s.B03/10000, s.B04/10000, s.B08/10000, s.B11/10000];
+    }
+    """
+
+    req = SentinelHubRequest(
+        evalscript=evalscript,
+        input_data=[
+            SentinelHubRequest.input_data(
+                data_collection=DataCollection.SENTINEL2_L2A,
+                time_interval=(f"{date}T00:00:00Z", f"{date}T23:59:59Z"),
+            )
+        ],
+        responses=[SentinelHubRequest.output_response("default", MimeType.TIFF)],
+        bbox=bbox,
+        size=dims,
+        config=config,
+    )
+
+    try:
+        data = req.get_data()
+        if not data:
+            return None
+
+        raw = data[0]
+        rgb = (_normalize_for_ndvi(raw[:, :, [2, 1, 0]]) * 255).astype(np.uint8)
+        return {"raw": raw, "rgb": Image.fromarray(rgb)}
+    except Exception as e:
+        print(f"NDVI image fetch failed: {e}")
+        return None
+
+def to_f32(a: np.ndarray) -> np.ndarray:
+    return np.clip(a.astype(np.float32), 1e-6, None)
+
+def ndvi(nir: np.ndarray, red: np.ndarray) -> np.ndarray:
+    return (nir - red) / (nir + red + 1e-6)
+
+def ndbi(swir: np.ndarray, nir: np.ndarray) -> np.ndarray:
+    return (swir - nir) / (swir + nir + 1e-6)
+
+def ndwi(green: np.ndarray, nir: np.ndarray) -> np.ndarray:
+    return (green - nir) / (green + nir + 1e-6)
+
+def compute_ndvi_analysis(b: np.ndarray, a: np.ndarray) -> Dict[str, Any]:
+    """Compute comprehensive NDVI analysis including change detection"""
+    (B02b, B03b, B04b, B08b, B11b) = [to_f32(b[:, :, i]) for i in range(5)]
+    (B02a, B03a, B04a, B08a, B11a) = [to_f32(a[:, :, i]) for i in range(5)]
+
+    # Calculate indices for before and after
+    ndvi_before = ndvi(B08b, B04b)
+    ndvi_after = ndvi(B08a, B04a)
+    ndbi_before = ndbi(B11b, B08b)
+    ndbi_after = ndbi(B11a, B08a)
+    ndwi_before = ndwi(B03b, B08b)
+    ndwi_after = ndwi(B03a, B08a)
+
+    # Calculate changes
+    d_ndvi = ndvi_after - ndvi_before
+    d_ndbi = ndbi_after - ndbi_before
+    d_ndwi = ndwi_after - ndwi_before
+
+    valid = ((B02a + B03a + B04a + B08a + B11a) / 5) > VALID_MIN
+
+    # Change masks
+    veg_gain = (d_ndvi >= DNDVI_T) & valid
+    veg_loss = (d_ndvi <= -DNDVI_T) & valid
+    urb_gain = (d_ndbi >= DNDBI_T) & (d_ndvi <= 0) & valid
+    urb_loss = (d_ndbi <= -DNDBI_T) & valid
+    wat_gain = (d_ndwi >= DNDWI_T) & valid
+    wat_loss = (d_ndwi <= -DNDWI_T) & valid
+
+    # Statistics
+    total_pixels = int(valid.sum())
+    veg_gain_count = int(veg_gain.sum())
+    veg_loss_count = int(veg_loss.sum())
+    urb_gain_count = int(urb_gain.sum())
+    urb_loss_count = int(urb_loss.sum())
+    wat_gain_count = int(wat_gain.sum())
+    wat_loss_count = int(wat_loss.sum())
+
+    # NDVI statistics
+    ndvi_before_stats = {
+        "mean": float(np.mean(ndvi_before[valid])),
+        "std": float(np.std(ndvi_before[valid])),
+        "min": float(np.min(ndvi_before[valid])),
+        "max": float(np.max(ndvi_before[valid])),
+        "median": float(np.median(ndvi_before[valid]))
+    }
+
+    ndvi_after_stats = {
+        "mean": float(np.mean(ndvi_after[valid])),
+        "std": float(np.std(ndvi_after[valid])),
+        "min": float(np.min(ndvi_after[valid])),
+        "max": float(np.max(ndvi_after[valid])),
+        "median": float(np.median(ndvi_after[valid]))
+    }
+
+    return {
+        "ndvi_before": ndvi_before,
+        "ndvi_after": ndvi_after,
+        "ndvi_change": d_ndvi,
+        "change_masks": {
+            "vegetation_gain": veg_gain,
+            "vegetation_loss": veg_loss,
+            "urbanization": urb_gain,
+            "urban_loss": urb_loss,
+            "water_gain": wat_gain,
+            "water_loss": wat_loss
+        },
+        "statistics": {
+            "total_valid_pixels": total_pixels,
+            "vegetation_gain": {"count": veg_gain_count, "percentage": veg_gain_count/total_pixels*100 if total_pixels > 0 else 0},
+            "vegetation_loss": {"count": veg_loss_count, "percentage": veg_loss_count/total_pixels*100 if total_pixels > 0 else 0},
+            "urbanization": {"count": urb_gain_count, "percentage": urb_gain_count/total_pixels*100 if total_pixels > 0 else 0},
+            "urban_loss": {"count": urb_loss_count, "percentage": urb_loss_count/total_pixels*100 if total_pixels > 0 else 0},
+            "water_gain": {"count": wat_gain_count, "percentage": wat_gain_count/total_pixels*100 if total_pixels > 0 else 0},
+            "water_loss": {"count": wat_loss_count, "percentage": wat_loss_count/total_pixels*100 if total_pixels > 0 else 0}
+        },
+        "ndvi_statistics": {
+            "before": ndvi_before_stats,
+            "after": ndvi_after_stats,
+            "change": {
+                "mean_change": float(np.mean(d_ndvi[valid])),
+                "std_change": float(np.std(d_ndvi[valid])),
+                "significant_change_pixels": int(np.sum(np.abs(d_ndvi[valid]) >= DNDVI_T))
+            }
+        }
+    }
+
+def create_ndvi_visualizations(analysis_data: Dict[str, Any], after_img: Image.Image) -> Dict[str, str]:
+    """Create NDVI visualization overlays"""
+    visualizations = {}
+
+    # NDVI before/after heatmaps
+    ndvi_before = analysis_data["ndvi_before"]
+    ndvi_after = analysis_data["ndvi_after"]
+    ndvi_change = analysis_data["ndvi_change"]
+
+    # NDVI before visualization (green scale)
+    ndvi_before_norm = np.clip((ndvi_before + 1) / 2, 0, 1)  # Normalize -1 to 1 -> 0 to 1
+    ndvi_before_rgb = np.zeros((*ndvi_before.shape, 3), dtype=np.uint8)
+    ndvi_before_rgb[:, :, 1] = (ndvi_before_norm * 255).astype(np.uint8)  # Green channel
+    visualizations["ndvi_before"] = image_to_base64(Image.fromarray(ndvi_before_rgb))
+
+    # NDVI after visualization (green scale)
+    ndvi_after_norm = np.clip((ndvi_after + 1) / 2, 0, 1)
+    ndvi_after_rgb = np.zeros((*ndvi_after.shape, 3), dtype=np.uint8)
+    ndvi_after_rgb[:, :, 1] = (ndvi_after_norm * 255).astype(np.uint8)
+    visualizations["ndvi_after"] = image_to_base64(Image.fromarray(ndvi_after_rgb))
+
+    # NDVI change visualization (red-green scale)
+    ndvi_change_norm = np.clip((ndvi_change + 1) / 2, 0, 1)
+    ndvi_change_rgb = np.zeros((*ndvi_change.shape, 3), dtype=np.uint8)
+    ndvi_change_rgb[:, :, 0] = ((1 - ndvi_change_norm) * 255).astype(np.uint8)  # Red for loss
+    ndvi_change_rgb[:, :, 1] = (ndvi_change_norm * 255).astype(np.uint8)       # Green for gain
+    visualizations["ndvi_change"] = image_to_base64(Image.fromarray(ndvi_change_rgb))
+
+    # Change overlay on satellite image
+    change_masks = analysis_data["change_masks"]
+    base = np.array(after_img.resize((ndvi_change.shape[1], ndvi_change.shape[0])).convert("RGB"))
+    overlay = np.zeros_like(base)
+
+    # Color coding for different changes
+    overlay[change_masks["vegetation_gain"]] = [0, 200, 0]      # Bright green
+    overlay[change_masks["vegetation_loss"]] = [200, 0, 0]      # Red
+    overlay[change_masks["urbanization"]] = [128, 128, 128]     # Gray
+    overlay[change_masks["water_gain"]] = [0, 0, 200]          # Blue
+    overlay[change_masks["water_loss"]] = [200, 200, 0]        # Yellow
+
+    alpha = 0.45
+    blended = (base * (1 - alpha) + overlay * alpha).astype(np.uint8)
+    visualizations["change_overlay"] = image_to_base64(Image.fromarray(blended))
+
+    return visualizations
+
+def parse_intent(query: str) -> Dict[str, bool]:
+    """Parse user intent from query"""
+    q_low = query.lower()
+    intents = {
+        "vegetation_focus": any(k in q_low for k in ["deforest", "forest", "tree", "green cover", "ndvi", "vegetation"]),
+        "urban_focus": any(k in q_low for k in ["urban", "built-up", "construction", "sprawl", "ndbi"]),
+        "water_focus": any(k in q_low for k in ["flood", "water", "wetland", "reservoir", "lake", "ndwi"]),
+    }
+    if not any(intents.values()):
+        intents["general"] = True
+    else:
+        intents["general"] = False
+    return intents
+
+def generate_ndvi_recommendations(analysis_data: Dict[str, Any], intents: Dict[str, bool], location: str) -> List[str]:
+    """Generate recommendations based on NDVI analysis"""
+    recommendations = []
+    stats = analysis_data["statistics"]
+
+    if intents.get("vegetation_focus"):
+        veg_loss_pct = stats["vegetation_loss"]["percentage"]
+        veg_gain_pct = stats["vegetation_gain"]["percentage"]
+
+        if veg_loss_pct > 5:
+            recommendations.append(f"Significant vegetation loss detected ({veg_loss_pct:.1f}%). Consider implementing reforestation programs.")
+        if veg_gain_pct > 3:
+            recommendations.append(f"Positive vegetation growth observed ({veg_gain_pct:.1f}%). Monitor and protect these recovering areas.")
+        if veg_loss_pct > veg_gain_pct * 2:
+            recommendations.append("Vegetation loss exceeds growth. Urgent conservation measures may be needed.")
+
+    if intents.get("urban_focus"):
+        urban_growth_pct = stats["urbanization"]["percentage"]
+        if urban_growth_pct > 3:
+            recommendations.append(f"Rapid urbanization detected ({urban_growth_pct:.1f}%). Ensure sustainable development practices.")
+        if urban_growth_pct > 1:
+            recommendations.append("Monitor infrastructure development to balance growth with environmental protection.")
+
+    if intents.get("water_focus"):
+        water_loss_pct = stats["water_loss"]["percentage"]
+        water_gain_pct = stats["water_gain"]["percentage"]
+
+        if water_loss_pct > 2:
+            recommendations.append(f"Water body reduction detected ({water_loss_pct:.1f}%). Investigate potential drought or diversion issues.")
+        if water_gain_pct > 2:
+            recommendations.append(f"New water bodies detected ({water_gain_pct:.1f}%). Monitor for flooding or new water management projects.")
+
+    # General recommendations
+    total_change = sum(s["percentage"] for s in stats.values() if isinstance(s, dict) and "percentage" in s)
+    if total_change > 10:
+        recommendations.append("Significant landscape changes detected. Consider comprehensive environmental impact assessment.")
+
+    if len(recommendations) == 0:
+        recommendations.append("Landscape appears relatively stable. Continue regular monitoring for early change detection.")
+
+    return recommendations[:5]  # Limit to 5 recommendations
+
 # ===== API ENDPOINTS =====
 
 @app.get("/")
@@ -353,7 +729,28 @@ async def root():
                 "batch_analyze": "/analyze/batch",
                 "search_locations": "/locations/search",
                 "history": "/analyze/history"
+            },
+            "ndvi_analysis": {
+                "comprehensive_ndvi": "/analyze/ndvi",
+                "quick_ndvi": "/analyze/ndvi/{location}/quick",
+                "description": "NDVI-based vegetation change detection with socioeconomic correlation"
+            },
+            "data_endpoints": {
+                "socioeconomic": "/locations/{location}/socioeconomic",
+                "zip_analysis": "/zip-codes/{zip_code}/analysis",
+                "dataset_info": "/datasets/info"
             }
+        },
+        "features": {
+            "ndvi_analysis": [
+                "Vegetation gain/loss detection",
+                "Urban expansion tracking",
+                "Water body changes",
+                "Smart date selection",
+                "NDVI visualizations",
+                "Socioeconomic correlation",
+                "Actionable recommendations"
+            ]
         }
     }
 
@@ -931,6 +1328,177 @@ async def get_dataset_info():
             "fields": ["city", "state", "zip_code", "latitude", "longitude", "region", "metro_area"]
         }
     }
+
+# ===== NDVI ANALYSIS ENDPOINT =====
+
+@app.post("/analyze/ndvi", response_model=NDVIAnalysisResponse)
+async def analyze_ndvi(request: NDVIAnalysisRequest):
+    """
+    Comprehensive NDVI-based vegetation change detection and analysis
+
+    This endpoint provides advanced vegetation analysis using NDVI (Normalized Difference Vegetation Index)
+    calculations from Sentinel-2 satellite imagery. It includes:
+    - NDVI change detection between two time periods
+    - Vegetation gain/loss analysis
+    - Urban expansion detection
+    - Water body changes
+    - Smart date selection for optimal imagery
+    - Comprehensive visualizations
+    - Actionable recommendations
+    - Socioeconomic correlation analysis
+    """
+    try:
+        # 1) Geocode location
+        lat, lon = get_coordinates(request.location)
+        if lat is None or lon is None:
+            raise HTTPException(status_code=404, detail="Location not found")
+
+        # 2) Parse analysis intent
+        intents = parse_intent(request.analysis_focus)
+
+        # 3) Map parameters
+        buf = map_bbox_choice(request.zoom_level)
+        res_m = map_resolution_choice(request.resolution)
+
+        # 4) Smart date selection for NDVI analysis
+        start_date, end_date, all_dates = find_smart_dates(
+            lat, lon, buf, request.timeline_start, request.timeline_end
+        )
+
+        if not start_date or not end_date:
+            raise HTTPException(
+                status_code=404,
+                detail="No suitable Sentinel-2 imagery dates available for this area/time period"
+            )
+
+        # 5) Fetch satellite imagery with all required bands
+        before_img, after_img = await asyncio.gather(
+            fetch_ndvi_image(lat, lon, start_date, buf, res_m),
+            fetch_ndvi_image(lat, lon, end_date, buf, res_m),
+        )
+
+        if not before_img or not after_img:
+            raise HTTPException(
+                status_code=502,
+                detail="Failed to fetch satellite imagery. Try broader zoom level or different dates."
+            )
+
+        # 6) Compute comprehensive NDVI analysis
+        ndvi_analysis = compute_ndvi_analysis(before_img["raw"], after_img["raw"])
+
+        # 7) Extract change analysis summary
+        change_stats = ndvi_analysis["statistics"]
+        total_change_pct = sum(
+            change_stats[key]["percentage"]
+            for key in ["vegetation_gain", "vegetation_loss", "urbanization", "urban_loss", "water_gain", "water_loss"]
+        )
+
+        change_analysis = {
+            "total_change_percentage": round(total_change_pct, 2),
+            "dominant_change": max(change_stats.items(), key=lambda x: x[1]["percentage"] if isinstance(x[1], dict) else 0)[0],
+            "vegetation_change_net": change_stats["vegetation_gain"]["percentage"] - change_stats["vegetation_loss"]["percentage"],
+            "urban_change_net": change_stats["urbanization"]["percentage"] - change_stats["urban_loss"]["percentage"],
+            "water_change_net": change_stats["water_gain"]["percentage"] - change_stats["water_loss"]["percentage"],
+            "change_intensity": "high" if total_change_pct > 10 else "moderate" if total_change_pct > 5 else "low"
+        }
+
+        # 8) Generate recommendations if requested
+        recommendations = []
+        if request.want_recommendations:
+            recommendations = generate_ndvi_recommendations(ndvi_analysis, intents, request.location)
+
+        # 9) Create visualizations if requested
+        visualizations = {}
+        if request.want_visualizations:
+            visualizations = create_ndvi_visualizations(ndvi_analysis, after_img["rgb"])
+
+        # 10) Get socioeconomic correlation analysis
+        socioeconomic_correlation = None
+        try:
+            comprehensive_data = data_service.get_comprehensive_analysis(lat, lon, request.location)
+            if not comprehensive_data.get("error"):
+                # Correlate NDVI changes with socioeconomic indicators
+                census_data = comprehensive_data.get("census_data", {})
+                real_estate_data = comprehensive_data.get("real_estate_data", {})
+
+                socioeconomic_correlation = {
+                    "median_income": census_data.get("median_income", 0),
+                    "poverty_rate": census_data.get("poverty_rate", 0),
+                    "education_level": census_data.get("education_bachelor_plus", 0),
+                    "home_values": real_estate_data.get("avg_home_price", 0),
+                    "development_permits": real_estate_data.get("new_construction_permits", 0),
+                    "correlation_insights": {
+                        "development_pressure": "high" if real_estate_data.get("new_construction_permits", 0) > 20 else "low",
+                        "gentrification_indicator": "high" if census_data.get("median_income", 0) > 80000 and change_stats["urbanization"]["percentage"] > 3 else "low",
+                        "environmental_justice": "concern" if census_data.get("poverty_rate", 0) > 15 and change_stats["vegetation_loss"]["percentage"] > 5 else "stable"
+                    }
+                }
+        except Exception as e:
+            print(f"Socioeconomic correlation analysis failed: {e}")
+
+        # 11) Build response
+        return NDVIAnalysisResponse(
+            success=True,
+            location=request.location,
+            coordinates={"latitude": lat, "longitude": lon},
+            timeline_start=start_date,
+            timeline_end=end_date,
+            chosen_dates=[
+                {
+                    "date": start_date,
+                    "cloud": next((d["cloud"] for d in all_dates if d["date"] == start_date), "N/A")
+                },
+                {
+                    "date": end_date,
+                    "cloud": next((d["cloud"] for d in all_dates if d["date"] == end_date), "N/A")
+                }
+            ],
+            available_dates_count=len(all_dates),
+            timestamp=datetime.utcnow().isoformat() + "Z",
+            ndvi_analysis={
+                "ndvi_statistics": ndvi_analysis["ndvi_statistics"],
+                "change_statistics": change_stats,
+                "analysis_focus": request.analysis_focus,
+                "detected_intents": intents
+            },
+            change_analysis=change_analysis,
+            recommendations=recommendations,
+            visualizations=visualizations,
+            socioeconomic_correlation=socioeconomic_correlation
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        return NDVIAnalysisResponse(
+            success=False,
+            location=request.location,
+            coordinates={"latitude": 0, "longitude": 0},
+            timeline_start="",
+            timeline_end="",
+            chosen_dates=[],
+            available_dates_count=0,
+            timestamp=datetime.utcnow().isoformat() + "Z",
+            ndvi_analysis={"error": str(e)},
+            change_analysis={"error": str(e)},
+            recommendations=[f"Analysis failed: {str(e)}"],
+            visualizations={},
+            socioeconomic_correlation=None
+        )
+
+@app.get("/analyze/ndvi/{location}/quick")
+async def quick_ndvi_analysis(location: str, zoom_level: str = "City-Wide (0.025°)"):
+    """
+    Quick NDVI analysis with default parameters for rapid assessment
+    """
+    request = NDVIAnalysisRequest(
+        location=location,
+        zoom_level=zoom_level,
+        want_recommendations=True,
+        want_visualizations=True,
+        analysis_focus="vegetation"
+    )
+    return await analyze_ndvi(request)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
