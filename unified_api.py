@@ -23,6 +23,8 @@ from sentinelhub import (
     DataCollection, bbox_to_dimensions, SentinelHubCatalog
 )
 from dotenv import load_dotenv
+import pandas as pd
+from data_service import data_service
 
 # Load environment variables
 load_dotenv()
@@ -67,6 +69,9 @@ class ChangeDetectionResponse(BaseModel):
     dates: Optional[Dict[str, str]] = None
     statistics: Optional[Dict[str, Any]] = None
     images: Optional[Dict[str, str]] = None
+    socioeconomic_data: Optional[Dict[str, Any]] = None  # Added for datasets
+    real_estate_data: Optional[Dict[str, Any]] = None    # Added for datasets
+    comprehensive_analysis: Optional[Dict[str, Any]] = None  # Added for analysis
 
 # Advanced API Models (from geospatial agent)
 class AnalysisRequest(BaseModel):
@@ -416,6 +421,9 @@ async def detect_change(request: ChangeDetectionRequest):
             "overlay": image_to_base64(overlayed)
         }
 
+        # Get comprehensive socioeconomic and real estate analysis
+        comprehensive_data = data_service.get_comprehensive_analysis(lat, lon, request.location)
+
         return ChangeDetectionResponse(
             success=True,
             message="Change detection completed successfully",
@@ -426,7 +434,10 @@ async def detect_change(request: ChangeDetectionRequest):
                 "total_pixels": total_pixels,
                 "change_percentage": round(change_percentage, 2)
             },
-            images=images
+            images=images,
+            socioeconomic_data=comprehensive_data.get("census_data"),
+            real_estate_data=comprehensive_data.get("real_estate_data"),
+            comprehensive_analysis=comprehensive_data.get("analysis")
         )
 
     except Exception as e:
@@ -841,6 +852,85 @@ async def get_analysis_summary():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get summary: {str(e)}")
+
+# ===== SOCIOECONOMIC AND REAL ESTATE DATA ENDPOINTS =====
+
+@app.get("/locations/{location}/socioeconomic")
+async def get_socioeconomic_data(location: str):
+    """Get comprehensive socioeconomic and real estate data for a location"""
+    try:
+        lat, lon = get_coordinates(location)
+        if lat is None:
+            raise HTTPException(status_code=404, detail="Location not found")
+
+        comprehensive_data = data_service.get_comprehensive_analysis(lat, lon, location)
+
+        if comprehensive_data.get("error"):
+            raise HTTPException(status_code=404, detail=comprehensive_data["error"])
+
+        return {
+            "location": location,
+            "coordinates": {"latitude": lat, "longitude": lon},
+            "zip_code": comprehensive_data.get("zip_code"),
+            "census_data": comprehensive_data.get("census_data"),
+            "real_estate_data": comprehensive_data.get("real_estate_data"),
+            "analysis": comprehensive_data.get("analysis")
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+@app.get("/zip-codes/{zip_code}/analysis")
+async def get_zip_code_analysis(zip_code: str):
+    """Get analysis for a specific ZIP code"""
+    try:
+        census_data = data_service.get_census_data(zip_code)
+        real_estate_data = data_service.get_real_estate_data(zip_code)
+
+        if not census_data or not real_estate_data:
+            raise HTTPException(status_code=404, detail="No data available for this ZIP code")
+
+        analysis = data_service._generate_analysis(census_data, real_estate_data)
+
+        return {
+            "zip_code": zip_code,
+            "census_data": census_data,
+            "real_estate_data": real_estate_data,
+            "analysis": analysis
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+@app.get("/datasets/info")
+async def get_dataset_info():
+    """Get information about available datasets"""
+    return {
+        "census_data": {
+            "description": "US Census demographic and socioeconomic data by ZIP code",
+            "fields": [
+                "population", "median_income", "poverty_rate", "unemployment_rate",
+                "education_bachelor_plus", "median_age", "housing_units",
+                "owner_occupied_rate", "median_home_value"
+            ]
+        },
+        "real_estate_data": {
+            "description": "Real estate market data and trends by ZIP code",
+            "fields": [
+                "avg_home_price", "price_per_sqft", "inventory_months", "days_on_market",
+                "new_construction_permits", "foreclosure_rate", "rent_median",
+                "rent_growth_yoy", "commercial_vacancy_rate"
+            ]
+        },
+        "geographic_mapping": {
+            "description": "Geographic location mappings with coordinates",
+            "fields": ["city", "state", "zip_code", "latitude", "longitude", "region", "metro_area"]
+        }
+    }
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

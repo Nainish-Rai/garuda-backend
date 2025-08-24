@@ -1,0 +1,16 @@
+city,state,zip_code,latitude,longitude,region,metro_area
+New York,NY,10001,40.7505,-73.9934,Northeast,New York Metro
+New York,NY,10002,40.7157,-73.9877,Northeast,New York Metro
+New York,NY,10003,40.7316,-73.9890,Northeast,New York Metro
+Beverly Hills,CA,90210,34.0901,-118.4065,West,Los Angeles Metro
+Beverly Hills,CA,90211,34.0736,-118.4004,West,Los Angeles Metro
+Atlanta,GA,30309,33.7901,-84.3820,Southeast,Atlanta Metro
+Atlanta,GA,30318,33.7765,-84.4153,Southeast,Atlanta Metro
+Chicago,IL,60601,41.8827,-87.6233,Midwest,Chicago Metro
+Chicago,IL,60602,41.8827,-87.6369,Midwest,Chicago Metro
+San Francisco,CA,94102,37.7805,-122.4132,West,San Francisco Metro
+San Francisco,CA,94103,37.7749,-122.4194,West,San Francisco Metro
+Houston,TX,77002,29.7520,-95.3695,Southwest,Houston Metro
+Houston,TX,77003,29.7342,-95.3698,Southwest,Houston Metro
+Washington,DC,20001,38.9072,-77.0369,Northeast,Washington Metro
+Washington,DC,20002,38.8905,-77.0047,Northeast,Washington Metro
